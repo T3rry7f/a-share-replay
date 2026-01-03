@@ -42,7 +42,10 @@ env/
 
 # Data files
 data/tick_*/
-*.parquet
+# 排除其他日期的 tick 数据，但保留 20251231 的示例数据
+data/*/tick/
+!data/20251231/tick/
+!data/20251231/tick/*.parquet
 *.csv.gz
 *.xlsx
 *.xls
