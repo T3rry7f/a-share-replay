@@ -835,27 +835,40 @@ def render_replay_page():
         
         data_dirs = []
         
-        # 查找新结构
+        # 查找包含数据的目录
         for date_dir in Path("data").glob("*"):
             if date_dir.is_dir() and date_dir.name.isdigit() and len(date_dir.name) == 8:
+                # 检查是否包含合并后的数据文件（优先）或传统的 tick 文件夹
+                merged_file = date_dir / "tick_data.parquet"
                 tick_dir = date_dir / "tick"
-                if tick_dir.exists() and tick_dir.is_dir():
+                if merged_file.exists():
+                    data_dirs.append(date_dir)
+                elif tick_dir.exists() and tick_dir.is_dir():
                     data_dirs.append(tick_dir)
         
-        # 查找旧结构
-        data_dirs.extend(list(Path("data").glob("tick_*")))
+        # 查找旧结构 (tick_YYYYMMDD)
+        old_dirs = list(Path("data").glob("tick_*"))
+        for d in old_dirs:
+            if d.is_dir():
+                data_dirs.append(d)
         
         if not data_dirs:
             st.error("未找到数据目录,请先下载数据!")
             st.stop()
         
-        # 按日期排序（最新的在前）
-        data_dirs.sort(reverse=True, key=lambda x: x.name if x.name.startswith('tick_') else x.parent.name)
+        # 自定义排序键
+        def get_date_key(path):
+            name = path.name
+            if name.startswith('tick_'): return name.replace('tick_', '')
+            if name == 'tick': return path.parent.name
+            return name # 目录本身就是日期名 (如 20240103)
+            
+        data_dirs.sort(reverse=True, key=get_date_key)
         
         selected_dir = st.selectbox(
             "选择交易日期",
             options=data_dirs,
-            format_func=lambda x: x.name.replace("tick_", "") if x.name.startswith("tick_") else x.parent.name
+            format_func=get_date_key
         )
         
         st.divider()

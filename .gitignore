@@ -42,7 +42,6 @@ env/
 
 # Data files
 data/tick_*/
-data/*/tick/
 *.csv.gz
 *.xlsx
 *.xls

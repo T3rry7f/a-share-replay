@@ -258,20 +258,26 @@ class ReplayEngine:
         # ✅ 性能优化：优先使用单文件快速加载
         # ========================================
         
-        # 检查是否存在合并的单文件格式
-        tick_data_file = self.data_dir.parent / "tick_data.parquet" if self.data_dir.name == 'tick' else self.data_dir.parent / "tick_data.parquet"
+        # 检查是否存在合并的单文件格式 
+        # 情况1: self.data_dir 是 tick/ 文件夹，合并文件在父目录
+        # 情况2: self.data_dir 就是日期目录，合并文件就在此处
+        tick_data_file = self.data_dir / "tick_data.parquet" if not self.data_dir.name == 'tick' else self.data_dir.parent / "tick_data.parquet"
         
         if tick_data_file.exists():
-            logging.info(f"⚡ 检测到优化格式，使用快速加载: {tick_data_file.name}")
+            logging.info(f"⚡ 检测到优化格式，使用快速加载: {tick_data_file}")
             return self._load_from_single_file(tick_data_file, progress_callback)
         
-        # 否则使用传统的多文件加载
+        # 否则使用传统的多文件加载 (单个股票一个文件)
         parquet_files = list(self.data_dir.glob("*.parquet"))
+        
+        # 排除掉合并文件，以防万一遍历到了 (虽然概率极低)
+        parquet_files = [f for f in parquet_files if f.name != "tick_data.parquet"]
+        
         total = len(parquet_files)
         loaded_count = 0
         
         if total == 0:
-            logging.warning(f"目录 {self.data_dir} 中未找到parquet文件")
+            logging.warning(f"目录 {self.data_dir} 中未找到有效的parquet文件")
             return 0
         
         logging.info(f"开始多线程加载 {total} 只股票数据，线程数: {max_workers}")
