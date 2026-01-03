@@ -202,9 +202,9 @@ class StockDataDownloader:
         else:
             logging.error("没有可用服务器，尝试使用默认列表继续（可能会很慢）...")
         
-        # 创建保存目录
+        # 创建保存目录 (新格式: data/日期/tick)
         if output_dir is None:
-            output_dir = f"data/tick_{date_int}"
+            output_dir = f"data/{date_int}/tick"
         os.makedirs(output_dir, exist_ok=True)
         
         logging.info(f"开始下载 {date_int} 的数据,共 {len(self.stocks_df)} 只股票")
@@ -250,6 +250,12 @@ class StockDataDownloader:
                 failed_list = retry_failed
                 retry_round += 1
         
+        # ========================================
+        # ✅ 性能优化：自动合并为单文件格式
+        # ========================================
+        if success_count > 0:
+            self._merge_to_single_file(date_int, output_dir)
+        
         # 生成下载报告
         self._generate_report(date_int, output_dir, success_count, failed_list)
     
@@ -293,6 +299,103 @@ class StockDataDownloader:
                             pass
         
         return success_count, failed_list
+    
+    def _merge_to_single_file(self, date_int, output_dir):
+        """
+        将下载的分散parquet文件合并为单个优化格式的文件
+        
+        Args:
+            date_int: 日期
+            output_dir: 输出目录
+        """
+        import time
+        from pathlib import Path
+        import shutil
+        
+        logging.info("="*50)
+        logging.info("⚡ 开始合并数据文件...")
+        start_time = time.time()
+        
+        # 查找所有parquet文件（排除已存在的tick_data.parquet）
+        tick_dir = Path(output_dir)
+        parquet_files = [f for f in tick_dir.glob("*.parquet") if f.name != "tick_data.parquet"]
+        
+        if not parquet_files:
+            logging.warning("未找到需要合并的文件")
+            return
+        
+        logging.info(f"   发现 {len(parquet_files)} 个数据文件")
+        
+        # 读取所有文件并合并
+        all_dataframes = []
+        for file_path in parquet_files:
+            try:
+                df = pd.read_parquet(file_path)
+                
+                # 确保有stock_code列
+                if 'stock_code' not in df.columns:
+                    df['stock_code'] = file_path.stem
+                
+                all_dataframes.append(df)
+            except Exception as e:
+                logging.warning(f"   读取 {file_path.name} 失败: {e}")
+        
+        if not all_dataframes:
+            logging.error("没有成功读取任何数据文件")
+            return
+        
+        # 合并所有DataFrame
+        logging.info("   正在合并数据...")
+        combined_df = pd.concat(all_dataframes, ignore_index=True)
+        
+        # 确保datetime列存在
+        if 'datetime' not in combined_df.columns:
+            if 'time' in combined_df.columns and 'date' in combined_df.columns:
+                combined_df['datetime'] = pd.to_datetime(
+                    combined_df['date'].astype(str) + ' ' + combined_df['time'].astype(str)
+                )
+        
+        # 数据类型优化
+        if 'stock_code' in combined_df.columns:
+            combined_df['stock_code'] = combined_df['stock_code'].astype('category')
+        if 'stock_name' in combined_df.columns:
+            combined_df['stock_name'] = combined_df['stock_name'].astype('category')
+        
+        # 排序（按股票代码和时间）
+        if 'datetime' in combined_df.columns:
+            logging.info("   正在排序...")
+            combined_df = combined_df.sort_values(['stock_code', 'datetime']).reset_index(drop=True)
+        
+        # 保存为单个优化文件（保存到日期目录，文件名固定为 tick_data.parquet）
+        merged_file = tick_dir.parent / "tick_data.parquet"
+        logging.info(f"   正在保存到 {merged_file}...")
+        
+        combined_df.to_parquet(
+            merged_file,
+            engine='pyarrow',
+            compression='snappy',
+            index=False
+        )
+        
+        file_size_mb = merged_file.stat().st_size / 1024 / 1024
+        elapsed = time.time() - start_time
+        
+        logging.info(f"✅ 合并完成!")
+        logging.info(f"   文件: {merged_file}")
+        logging.info(f"   大小: {file_size_mb:.2f} MB")
+        logging.info(f"   总行数: {len(combined_df):,}")
+        logging.info(f"   股票数: {combined_df['stock_code'].nunique():,}")
+        logging.info(f"   耗时: {elapsed:.2f} 秒")
+        
+        # 询问是否删除原始分散文件
+        logging.info("-"*50)
+        logging.info("💡 提示: 分散文件已合并为单文件，是否删除原始分散文件以节省空间？")
+        logging.info(f"   分散文件目录: {tick_dir}")
+        logging.info(f"   合并文件: {merged_file}")
+        logging.info("   (您可以手动删除 tick_* 目录以节省空间)")
+        logging.info("-"*50)
+        
+        return merged_file
         
     def _generate_report(self, date_int, output_dir, success_count, failed_list):
         """生成下载报告"""

@@ -16,7 +16,7 @@ sys.path.append(str(Path(__file__).parent))
 from replay_engine import ReplayEngine
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from sector_analysis import render_sector_analysis, render_sector_heatmap, render_rapid_rise_sectors
+from sector_analysis import render_sector_analysis, render_sector_heatmap, render_rapid_rise_sectors, render_sector_detail_view
 from downloader import StockDataDownloader
 from download_pre_close import download_pre_close_parallel, get_stock_pre_close_single
 from config import SECTOR_MAPPING_CONFIG
@@ -32,10 +32,11 @@ st.set_page_config(
 # 自定义样式
 st.markdown("""
 <style>
-    .stMetric {
-        background-color: #f0f2f6;
+    div[data-testid="stMetric"], .stMetric {
+        background-color: rgba(255, 255, 255, 0.05);
         padding: 10px;
-        border-radius: 5px;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
     }
     .big-font {
         font-size: 24px !important;
@@ -92,6 +93,10 @@ def auto_refresh_display(engine, current_date, start_time, end_time,
                 if st.session_state.replay_time.time() < time(11, 30):
                     new_time = datetime.combine(current_date, time(13, 0))
             
+            # 修正：确保不超过结束时间 (15:00)
+            if new_time > end_datetime:
+                new_time = end_datetime
+            
             st.session_state.replay_time = new_time
     
     current_time = st.session_state.replay_time
@@ -107,19 +112,33 @@ def auto_refresh_display(engine, current_date, start_time, end_time,
     if hasattr(engine, 'data_start_time') and engine.data_start_time:
         start_datetime = engine.data_start_time
     
-    # 计算总秒数
-    total_seconds = int((end_datetime - start_datetime).total_seconds())
-    current_seconds = int((current_time - start_datetime).total_seconds())
-    
+    # 确保当前时间在范围内 (鲁棒性检查)
+    slider_value = current_time
+    if slider_value < start_datetime: slider_value = start_datetime
+    if slider_value > end_datetime: slider_value = end_datetime
+
     # 创建滑块和控制按钮
     col_slider, col_btn_play, col_btn_reset, col_time = st.columns([6, 0.8, 0.8, 1.2])
     
+    # 确保时间类型统一为 python datetime (避免 pandas Timestamp 导致的 streamlit 错误)
+    def to_pydatetime(dt):
+        if hasattr(dt, 'to_pydatetime'):
+            return dt.to_pydatetime()
+        return dt
+
+    start_datetime = to_pydatetime(start_datetime)
+    end_datetime = to_pydatetime(end_datetime)
+    slider_value = to_pydatetime(slider_value)
+
     with col_slider:
-        new_seconds = st.slider(
+        # 使用 datetime 对象作为滑块，支持 format 显示时间预览
+        new_replay_time = st.slider(
             "🕐 时间轴",
-            min_value=0,
-            max_value=total_seconds,
-            value=current_seconds,
+            min_value=start_datetime,
+            max_value=end_datetime,
+            value=slider_value,
+            step=pd.Timedelta(seconds=1).to_pytimedelta(), # step 也要统一
+            format="HH:mm:ss",
             label_visibility="collapsed"
         )
         
@@ -140,17 +159,22 @@ def auto_refresh_display(engine, current_date, start_time, end_time,
             st.session_state.auto_refresh = False
 
     with col_time:
-        slider_time = start_datetime + pd.Timedelta(seconds=new_seconds)
         # 垂直居中对齐时间
-        st.markdown(f"<div style='line-height: 2.2;'>⏱️ {slider_time.strftime('%H:%M:%S')}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='line-height: 2.2;'>⏱️ {new_replay_time.strftime('%H:%M:%S')}</div>", unsafe_allow_html=True)
     
     # 如果用户拖动了滑块，更新时间
-    if new_seconds != current_seconds:
-        st.session_state.replay_time = start_datetime + pd.Timedelta(seconds=new_seconds)
+    if new_replay_time != slider_value:
+        st.session_state.replay_time = new_replay_time
         st.session_state.auto_refresh = False  # 拖动时自动暂停
     
     # 获取快照
     snapshot = engine.get_snapshot_at_time(current_time)
+    
+    # --- 检查是否处于板块详情模式 (Drill-down) ---
+    if st.session_state.get('active_sector'):
+        render_sector_detail_view(engine, snapshot)
+        return
+    # ----------------------------------------
     
     # 显示市场统计 - 使用自定义样式确保文字清晰
     col1, col2, col3, col4 = st.columns(4)
@@ -427,7 +451,8 @@ def auto_refresh_display(engine, current_date, start_time, end_time,
                                 fig = make_subplots(
                                     rows=2, cols=1,
                                     row_heights=[0.7, 0.3],
-                                    vertical_spacing=0.05
+                                    vertical_spacing=0.05,
+                                    specs=[[{"secondary_y": True}], [{"secondary_y": False}]]
                                 )
                                 
                                 # 价格线
@@ -467,15 +492,52 @@ def auto_refresh_display(engine, current_date, start_time, end_time,
                                 )
                                 
                                 # 更新布局
+                                # 更新布局
                                 current_price = display_data['price'].iloc[-1]
-                                pct_change = ((current_price - pre_close) / pre_close * 100) if 'pre_close' in display_data.columns else 0
                                 
+                                # 确定昨收价和价格范围
+                                if 'pre_close' in display_data.columns:
+                                    real_pre_close = display_data['pre_close'].iloc[0]
+                                    pct_change = (current_price - real_pre_close) / real_pre_close * 100
+                                else:
+                                    real_pre_close = display_data['price'].iloc[0] # Fallback
+                                    pct_change = 0
+
+                                # 计算涨跌停范围
+                                # 计算基础涨跌停范围
+                                base_limit = 0.2 if (stock_code.startswith('688') or stock_code.startswith('300') or stock_code.startswith('689')) else 0.1
+                                if stock_code.startswith(('8', '4', '92')): base_limit = 0.3
+                                
+                                # 检查实际价格波动是否超过限制 (如新股上市)
+                                max_price = display_data['price'].max()
+                                min_price = display_data['price'].min()
+                                max_dev = max(abs(max_price - real_pre_close), abs(min_price - real_pre_close)) / real_pre_close
+                                
+                                # 如果实际波动超过基础限制，则使用实际波动+10%余量
+                                limit_ratio = max(base_limit, max_dev * 1.1)
+                                
+                                y_min = real_pre_close * (1 - limit_ratio)
+                                y_max = real_pre_close * (1 + limit_ratio)
+
                                 fig.update_layout(
                                     title=f"{stock_code} {stock_name} - 当前: ¥{current_price:.2f} ({pct_change:+.2f}%)",
                                     height=450,
                                     showlegend=False,
                                     hovermode='x unified',
-                                    margin=dict(l=0, r=0, t=40, b=0)
+                                    margin=dict(l=0, r=0, t=40, b=0),
+                                    yaxis=dict(
+                                        title="价格",
+                                        range=[y_min, y_max],
+                                        tickformat=".2f",
+                                        gridcolor='rgba(128,128,128,0.2)'
+                                    ),
+                                    yaxis2=dict(
+                                        title="涨跌幅",
+                                        range=[-limit_ratio*100, limit_ratio*100],
+                                        tickformat=".1f",
+                                        ticksuffix="%",
+                                        showgrid=False
+                                    )
                                 )
                                 
                                 fig.update_xaxes(tickformat="%H:%M")
@@ -809,7 +871,8 @@ def auto_refresh_display(engine, current_date, start_time, end_time,
                         rows=2, cols=1,
                         row_heights=[0.7, 0.3],
                         subplot_titles=('价格走势', '成交量'),
-                        vertical_spacing=0.05
+                        vertical_spacing=0.05,
+                        specs=[[{"secondary_y": True}], [{"secondary_y": False}]]
                     )
                     
                     fig.add_trace(
@@ -851,16 +914,53 @@ def auto_refresh_display(engine, current_date, start_time, end_time,
                     
                     current_price = display_data['price'].iloc[-1]
                     stock_name = engine.get_stock_name(selected_stock)
-                    pct_change = ((current_price - pre_close) / pre_close * 100) if 'pre_close' in display_data.columns else 0
+                    
+                    if 'pre_close' in display_data.columns:
+                        real_pre_close = display_data['pre_close'].iloc[0]
+                        pct_change = (current_price - real_pre_close) / real_pre_close * 100
+                    else:
+                        real_pre_close = display_data['price'].iloc[0]
+                        pct_change = 0
+
+                    # 计算涨跌停范围
+                    # 计算基础涨跌停范围
+                    base_limit = 0.2 if (selected_stock.startswith('688') or selected_stock.startswith('300') or selected_stock.startswith('689')) else 0.1
+                    if selected_stock.startswith(('8', '4', '92')): base_limit = 0.3
+                    
+                    # 检查实际价格波动是否超过限制 (如新股上市)
+                    max_price = display_data['price'].max()
+                    min_price = display_data['price'].min()
+                    max_dev = max(abs(max_price - real_pre_close), abs(min_price - real_pre_close)) / real_pre_close
+                    
+                    # 如果实际波动超过基础限制，则使用实际波动+10%余量
+                    limit_ratio = max(base_limit, max_dev * 1.1)
+                    
+                    y_min = real_pre_close * (1 - limit_ratio)
+                    y_max = real_pre_close * (1 + limit_ratio)
                     
                     fig.update_layout(
                         title=f"{selected_stock} {stock_name} - 当前: ¥{current_price:.2f} ({pct_change:+.2f}%)",
                         xaxis_title="时间",
                         yaxis_title="价格(元)",
-                        yaxis2_title="成交量(手)",
+                        yaxis_title_standoff=0,
                         height=600,
                         showlegend=True,
-                        hovermode='x unified'
+                        hovermode='x unified',
+                        yaxis=dict(
+                            title="价格",
+                            range=[y_min, y_max],
+                            tickformat=".2f",
+                            gridcolor='rgba(128,128,128,0.2)'
+                        ),
+                        yaxis2=dict(
+                            title="涨跌幅",
+                            range=[-limit_ratio*100, limit_ratio*100],
+                            tickformat=".1f",
+                            ticksuffix="%",
+                            showgrid=False,
+                            overlaying="y", 
+                            side="right"
+                        )
                     )
                     
                     fig.update_xaxes(tickformat="%H:%M")
@@ -990,7 +1090,12 @@ def render_replay_page():
     if 'engine' not in st.session_state or st.session_state.get('current_dir') != str(selected_dir):
         st.session_state.initialized = False
         with st.spinner("正在初始化复盘引擎..."):
-            st.session_state.engine = ReplayEngine(str(selected_dir))
+            tick_data_file = selected_dir.parent / "tick_data.parquet"
+            if tick_data_file.exists():
+                st.session_state.engine = ReplayEngine(str(tick_data_file.parent / "tick"))
+                #logging.info(f"使用优化格式: {tick_data_file}")
+            else:
+                st.session_state.engine = ReplayEngine(str(selected_dir))
             
             st.session_state.current_dir = str(selected_dir)
             st.session_state.loaded_stocks = set()

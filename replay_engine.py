@@ -41,6 +41,7 @@ class ReplayEngine:
         self.pre_close_map = {}  # {stock_code: pre_close} 真实昨收价
         
         # 实时缓存
+        self.fast_data_cache = {} # {code: (times, prices, vols, pre_close)} 纯NumPy极速缓存
         self.stock_cache = {}  # 股票实时数据缓存
         self.sector_cache = {}  # 板块实时数据缓存
         
@@ -235,6 +236,18 @@ class ReplayEngine:
         Returns:
             成功加载的股票数量
         """
+        # ========================================
+        # ✅ 性能优化：优先使用单文件快速加载
+        # ========================================
+        
+        # 检查是否存在合并的单文件格式
+        tick_data_file = self.data_dir.parent / "tick_data.parquet" if self.data_dir.name == 'tick' else self.data_dir.parent / "tick_data.parquet"
+        
+        if tick_data_file.exists():
+            logging.info(f"⚡ 检测到优化格式，使用快速加载: {tick_data_file.name}")
+            return self._load_from_single_file(tick_data_file, progress_callback)
+        
+        # 否则使用传统的多文件加载
         parquet_files = list(self.data_dir.glob("*.parquet"))
         total = len(parquet_files)
         loaded_count = 0
@@ -264,44 +277,135 @@ class ReplayEngine:
         logging.info(f"数据加载完成: {loaded_count}/{total}")
         return loaded_count
     
+    def _load_from_single_file(self, tick_data_file: Path, progress_callback=None) -> int:
+        """
+        从合并的单个parquet文件快速加载所有股票数据
+        (极致优化版：向量化预处理 + 极速拆分)
+        """
+        import time
+        start_time = time.time()
+        
+        logging.info(f"⚡ 快速加载模式：正在读取数据...")
+        
+        # 1. 极速读取
+        df = pd.read_parquet(tick_data_file)
+        
+        read_time = time.time() - start_time
+        logging.info(f"   读取完成: {read_time:.2f}秒 (行数: {len(df):,})")
+        
+        process_start = time.time()
+        logging.info(f"   正在进行全量向量化预处理...")
+
+        # 2. 全量预处理 (Vectorized Preprocessing) - 在循环外一次性完成
+        
+        # A. 确保时间列 
+        if 'datetime' not in df.columns:
+            if 'date' in df.columns and 'time' in df.columns:
+                df['datetime'] = pd.to_datetime(df['date'].astype(str) + ' ' + df['time'].astype(str))
+            elif 'time' in df.columns:
+                from datetime import date as dt_date
+                today = dt_date.today().strftime('%Y%m%d')
+                df['datetime'] = pd.to_datetime(today + ' ' + df['time'].astype(str))
+        
+        # B. 向量化计算累计成交量
+        if 'vol' in df.columns:
+            # GroupBy + CumSum 速度非常快
+            df['cum_volume'] = df.groupby('stock_code')['vol'].cumsum()
+        
+        # C. 向量化匹配昨收价
+        if self.pre_close_map and 'stock_code' in df.columns:
+            # 确保代码格式一致
+            df['stock_code'] = df['stock_code'].astype(str).str.zfill(6)
+            # 映射昨收价
+            df['pre_close'] = df['stock_code'].map(self.pre_close_map).astype('float32')
+            
+            # 对未匹配到的填充每组的第一笔价格
+            if df['pre_close'].isnull().any():
+                if 'price' in df.columns:
+                    first_prices = df.groupby('stock_code')['price'].transform('first')
+                    df['pre_close'] = df['pre_close'].fillna(first_prices)
+        elif 'price' in df.columns:
+             # 如果没有昨收价表，全部使用第一笔价格
+             df['pre_close'] = df.groupby('stock_code')['price'].transform('first')
+        
+        process_time = time.time() - process_start
+        logging.info(f"   预处理完成: {process_time:.2f}秒 (向量化)")
+        
+        # 3. 极速拆分
+        split_start = time.time()
+        total_stocks = df['stock_code'].nunique()
+        logging.info(f"   正在拆分为 {total_stocks} 只股票...")
+        
+        loaded_count = 0
+        has_vol = 'vol' in df.columns
+        has_cum_vol = 'cum_volume' in df.columns
+        
+        # 使用 groupby 迭代拆分
+        for stock_code, group_df in df.groupby('stock_code'):
+            # 关键修复: 必须 reset_index
+            stock_df = group_df.reset_index(drop=True)
+            
+            self.all_data[stock_code] = stock_df
+            
+            # --- 构建极速缓存 (Pure NumPy) ---
+            # 提取 float32 数组以节省内存并加速
+            t_values = stock_df['datetime'].values
+            p_values = stock_df['price'].values
+            v_values = stock_df['cum_volume'].values if has_cum_vol else None
+            
+            # 提取昨收价 (标量)
+            pre_close = float(stock_df['pre_close'].iloc[0]) if 'pre_close' in stock_df.columns else float(p_values[0])
+            
+            self.fast_data_cache[stock_code] = (t_values, p_values, v_values, pre_close)
+            
+            loaded_count += 1
+            
+            if progress_callback and loaded_count % 1000 == 0:
+                 progress_callback(loaded_count, total_stocks)
+                 
+        if progress_callback:
+            progress_callback(total_stocks, total_stocks)
+            
+        split_time = time.time() - split_start
+        total_time = time.time() - start_time
+        
+        logging.info(f"   拆分与缓存: {split_time:.2f}秒")
+        logging.info(f"✅ 极速加载完成: {total_time:.2f}秒!")
+        
+        return loaded_count
+    
     def get_snapshot_at_time(self, target_time: datetime) -> Dict:
         """
-        获取指定时间点的市场快照 - 超高速版 + LRU缓存
+        获取指定时间点的市场快照 - 极速版 (Pure NumPy)
         
-        使用缓存的NumPy数组、索引追踪和快照缓存，避免重复计算
-        
-        Args:
-            target_time: 目标时间
-            
-        Returns:
-            市场快照数据
+        完全绕过 Pandas DataFrame，直接操作预缓存的 NumPy 数组。
+        性能提升目标：比原有逻辑快 10-50 倍。
         """
         # 生成缓存键（精确到秒）
         time_key = target_time.strftime('%Y%m%d_%H%M%S')
         
-        # 检查缓存
+        # 检查快照缓存 (LRU)
         if time_key in self.snapshot_cache:
             # 更新LRU顺序
             if time_key in self.snapshot_cache_order:
                 self.snapshot_cache_order.remove(time_key)
             self.snapshot_cache_order.append(time_key)
             
-            # 更新当前时间
             self.current_time = target_time
-            logging.debug(f"✅ 命中快照缓存: {time_key}")
             return self.snapshot_cache[time_key]
         
         self.current_time = target_time
         
         # 初始化索引缓存
         if not hasattr(self, 'index_cache'):
-            self.index_cache = {code: 0 for code in self.all_data.keys()}
+            self.index_cache = {code: 0 for code in self.fast_data_cache.keys()}
         
         # 检测时间回退，重置索引缓存
         if hasattr(self, 'last_snapshot_time') and target_time < self.last_snapshot_time:
-            self.index_cache = {code: 0 for code in self.all_data.keys()}
+            self.index_cache = {code: 0 for code in self.fast_data_cache.keys()}
         
         self.last_snapshot_time = target_time
+        
         snapshot = {
             'time': target_time,
             'stocks': {},
@@ -313,54 +417,53 @@ class ReplayEngine:
             }
         }
         
-        # 转换为 numpy.datetime64 加速比较
-        target_np = np.datetime64(target_time)
+        # 转换为 numpy.datetime64[ns] 以匹配 Pandas 的默认精度
+        target_np = np.array(target_time, dtype='datetime64[ns]')
         
-        # 遍历所有已加载股票 - 使用索引缓存优化
-        for stock_code, df in self.all_data.items():
-            if df.empty:
+        # 遍历极速缓存 (Pure NumPy Loop)
+        # 这里的 items() 迭代速度远快于 DataFrame 的 items 或 iterrows
+        for stock_code, (times, price_vals, vol_vals, pre_close) in self.fast_data_cache.items():
+            if len(times) == 0:
                 continue
-            
-            # 使用缓存的NumPy数组 - 避免重复访问pandas列
-            times = df['_datetime_values']
-            price_vals = df['_price_values']
-            vol_vals = df['_cum_vol_values']
-            
+
             # 获取上次查找的索引位置
             last_idx = self.index_cache.get(stock_code, 0)
             
+            # --- 极速索引查找 ---
             # 智能查找：如果时间递增，从上次位置开始线性查找（大多数情况）
-            # 否则使用二分查找
             if last_idx < len(times) and target_np >= times[last_idx]:
-                # 向前线性扫描（通常只需几步）
+                # 向前线性扫描
                 idx = last_idx
+                # 只有当差距较小时才线性扫描，否则还是二分快
                 while idx + 1 < len(times) and times[idx + 1] <= target_np:
                     idx += 1
             else:
                 # 时间回退或跳跃，使用二分查找
                 idx = np.searchsorted(times, target_np, side='right') - 1
             
-            # 更新缓存
+            # 更新索引缓存
             self.index_cache[stock_code] = max(0, idx)
             
             if idx >= 0:
-                # 使用NumPy数组直接访问，比iloc快10倍以上
+                # 直接访问 NumPy 数组 (极快)
                 current_price = price_vals[idx]
-                cum_volume = vol_vals[idx]
                 
-                # 获取昨收价
-                pre_close = df['pre_close'].iloc[0]
+                # 如果没有vol数据，设为0
+                cum_volume = vol_vals[idx] if vol_vals is not None else 0
                 
                 # 计算涨跌幅
-                pct_change = (current_price - pre_close) / pre_close * 100 if pre_close > 0 else 0
+                if pre_close > 0:
+                    pct_change = (current_price - pre_close) / pre_close * 100
+                else:
+                    pct_change = 0.0
                 
                 snapshot['stocks'][stock_code] = {
-                    'price': current_price,
-                    'volume': cum_volume,
-                    'pct_change': pct_change,
+                    'price': float(current_price),
+                    'volume': float(cum_volume),
+                    'pct_change': float(pct_change),
                 }
                 
-                # 统计涨跌家数
+                # 统计涨跌
                 if pct_change > 0.001:
                     snapshot['stats']['up_count'] += 1
                 elif pct_change < -0.001:
@@ -526,18 +629,15 @@ class ReplayEngine:
             return abnormal_stocks
         
         time_window_start = self.current_time - pd.Timedelta(minutes=time_window_minutes)
-        start_np = np.datetime64(time_window_start)
-        end_np = np.datetime64(self.current_time)
+        # 关键修正：确保与 times 数组的 datetime64[ns] 精度一致
+        start_np = np.array(time_window_start, dtype='datetime64[ns]')
+        end_np = np.array(self.current_time, dtype='datetime64[ns]')
         
-        # 遍历所有股票 - 使用缓存的NumPy数组
-        for stock_code, df in self.all_data.items():
-            if df.empty:
+        # 遍历极速缓存 (Pure NumPy Loop)
+        # items() 迭代比 DataFrame items 极快
+        for stock_code, (times, price_vals, cum_vol_vals, _) in self.fast_data_cache.items():
+            if len(times) == 0:
                 continue
-            
-            # 使用缓存的NumPy数组，避免重复访问pandas列
-            times = df['_datetime_values']
-            price_vals = df['_price_values']
-            vol_vals = df['_vol_values']
             
             # 使用二分查找定位窗口边界
             start_idx = np.searchsorted(times, start_np, side='left')
@@ -565,8 +665,15 @@ class ReplayEngine:
                         movement_type = 'fall'
                     
                     if is_abnormal:
-                        # 计算成交额（万元）- 使用NumPy数组直接计算
-                        window_vol = vol_vals[start_idx:end_idx+1].sum()
+                        # 计算成交额（万元）- 使用累计成交量差值 (O(1)复杂度)
+                        if cum_vol_vals is not None:
+                            # 累计量差值 = 结束时刻累计 - 开始前时刻累计
+                            vol_end = cum_vol_vals[end_idx]
+                            vol_start = cum_vol_vals[start_idx - 1] if start_idx > 0 else 0
+                            window_vol = vol_end - vol_start
+                        else:
+                            window_vol = 0
+                            
                         # 成交量单位是手(100股)，价格单位是元
                         volume_amount = window_vol * 100 * end_price / 10000
                         
