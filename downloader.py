@@ -160,12 +160,15 @@ class StockDataDownloader:
                         df['price'] = df['price'].astype('float32')
                     if 'vol' in df.columns:
                         df['vol'] = df['vol'].astype('int32')
+                    # 昨收价已通过补丁后的 pytdx 直接获取
+                    if 'pre_close' in df.columns:
+                        df['pre_close'] = df['pre_close'].astype('float32')
                     
                     # 保存为parquet格式(压缩+快速读取)
                     file_path = os.path.join(save_dir, f"{stock_code}.parquet")
                     df.to_parquet(file_path, compression='gzip', index=False)
                     
-                    return (stock_code, True, f"成功下载 {len(all_data)} 条数据")
+                    return (stock_code, True, f"成功下载 {len(all_data)} 条数据(含昨收价)")
                 else:
                     return (stock_code, False, f"当日无数据 (Exchange:{market})")
                     

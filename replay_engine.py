@@ -330,8 +330,12 @@ class ReplayEngine:
             # GroupBy + CumSum 速度非常快
             df['cum_volume'] = df.groupby('stock_code')['vol'].cumsum()
         
-        # C. 向量化匹配昨收价
-        if self.pre_close_map and 'stock_code' in df.columns:
+        # C. 处理昨收价
+        if 'pre_close' in df.columns:
+            # 如果下载的数据中已经包含了补丁后的昨收价，直接使用
+            # 确保类型正确
+            df['pre_close'] = df['pre_close'].astype('float32')
+        elif self.pre_close_map and 'stock_code' in df.columns:
             # 确保代码格式一致
             df['stock_code'] = df['stock_code'].astype(str).str.zfill(6)
             # 映射昨收价
@@ -343,7 +347,7 @@ class ReplayEngine:
                     first_prices = df.groupby('stock_code')['price'].transform('first')
                     df['pre_close'] = df['pre_close'].fillna(first_prices)
         elif 'price' in df.columns:
-             # 如果没有昨收价表，全部使用第一笔价格
+             # 如果没有昨收价表，且数据中也没有昨收价列，全部使用第一笔价格
              df['pre_close'] = df.groupby('stock_code')['price'].transform('first')
         
         process_time = time.time() - process_start
@@ -450,6 +454,8 @@ class ReplayEngine:
                 'up_count': 0,
                 'down_count': 0,
                 'flat_count': 0,
+                'limit_up_count': 0,
+                'limit_down_count': 0,
             }
         }
         
@@ -531,6 +537,27 @@ class ReplayEngine:
                     snapshot['stats']['down_count'] += 1
                 else:
                     snapshot['stats']['flat_count'] += 1
+                
+                # 统计涨跌停
+                # 1. 判定涨跌幅比例
+                if stock_code.startswith(('688', '300', '689')):
+                    ratio = 0.2
+                elif stock_code.startswith(('8', '4', '92')):
+                    ratio = 0.3
+                else:
+                    ratio = 0.1
+                    # 主板 ST 股 5%
+                    if "ST" in self.stock_name_map.get(stock_code, ""):
+                        ratio = 0.05
+                
+                # 2. 计算涨跌停价格 (同 detect_limit_movements 逻辑)
+                limit_up = round(pre_close * (1 + ratio) + 0.0001, 2)
+                limit_down = round(pre_close * (1 - ratio) + 0.0001, 2)
+                
+                if current_price >= limit_up:
+                    snapshot['stats']['limit_up_count'] += 1
+                elif current_price <= limit_down:
+                    snapshot['stats']['limit_down_count'] += 1
         
         snapshot['stats']['total_stocks'] = len(snapshot['stocks'])
         
@@ -748,6 +775,100 @@ class ReplayEngine:
         abnormal_stocks.sort(key=lambda x: abs(x['pct_change']), reverse=True)
         
         return abnormal_stocks
+
+    def detect_limit_movements(self) -> List[Dict]:
+        """
+        检测涨跌停异动（封板/炸板）
+        
+        Returns:
+            涨跌停异动列表
+        """
+        limit_events = []
+        if self.current_time is None:
+            return limit_events
+
+        end_np = np.array(self.current_time, dtype='datetime64[ns]')
+
+        for stock_code, (times, price_vals, _, pre_close) in self.fast_data_cache.items():
+            if len(times) == 0:
+                continue
+
+            # 寻找当前时间点对应的最新 Tick
+            end_idx = np.searchsorted(times, end_np, side='right') - 1
+            if end_idx < 0:
+                continue
+
+            # 只有在 Tick 刚刚发生变化时才触发异动（避免重复触发）
+            # 注意：这里的逻辑假设调用方会根据时间推移持续调用
+            # 为简单起见，我们检测 end_idx 对应的 Tick 时间是否就是当前“模拟秒”或者是最近几秒内
+            tick_time = pd.Timestamp(times[end_idx])
+            if (self.current_time - tick_time).total_seconds() >= 3:
+                # 如果这个 Tick 已经是 3 秒前的了，说明是老数据，不视作“新异动”
+                #（除非是刚开盘或者数据断流，这里权衡一下）
+                continue
+
+            current_price = price_vals[end_idx]
+            
+            # 计算该股的涨跌停价格
+            if stock_code.startswith(('688', '300', '689')):
+                ratio = 0.2
+            elif stock_code.startswith(('8', '4', '92')):
+                ratio = 0.3
+            else:
+                ratio = 0.1
+                # 只有主板的 ST 股才是 5% 限制，创业板和科创板 ST 仍是 20%
+                stock_name = self.stock_name_map.get(stock_code, "")
+                if "ST" in stock_name:
+                    ratio = 0.05
+                
+            # A股涨跌停计算通常是四舍五入到分，但为了稳健，我们使用 0.005 的偏移
+            limit_up = round(pre_close * (1 + ratio) + 0.0001, 2)
+            limit_down = round(pre_close * (1 - ratio) + 0.0001, 2)
+            
+            event_type = None
+            desc = ""
+            
+            if end_idx > 0:
+                prev_price = price_vals[end_idx - 1]
+                was_at_limit_up = prev_price >= limit_up
+                was_at_limit_down = prev_price <= limit_down
+                
+                is_at_limit_up = current_price >= limit_up
+                is_at_limit_down = current_price <= limit_down
+                
+                if not was_at_limit_up and is_at_limit_up:
+                    event_type = "hit_limit_up"
+                    desc = "🚀 封涨停"
+                elif was_at_limit_up and not is_at_limit_up:
+                    event_type = "break_limit_up"
+                    desc = "💥 炸涨停"
+                elif not was_at_limit_down and is_at_limit_down:
+                    event_type = "hit_limit_down"
+                    desc = "📉 封跌停"
+                elif was_at_limit_down and not is_at_limit_down:
+                    event_type = "break_limit_down"
+                    desc = "♻️ 炸跌停"
+            else:
+                # 开盘第一笔
+                if current_price >= limit_up:
+                    event_type = "hit_limit_up"
+                    desc = "🚀 涨停开盘"
+                elif current_price <= limit_down:
+                    event_type = "hit_limit_down"
+                    desc = "📉 跌停开盘"
+            
+            if event_type:
+                limit_events.append({
+                    'stock_code': stock_code,
+                    'stock_name': stock_name,
+                    'event_type': event_type,
+                    'desc': desc,
+                    'price': current_price,
+                    'time': tick_time.strftime('%H:%M:%S'),
+                    'pct_change': (current_price - pre_close) / pre_close * 100
+                })
+        
+        return limit_events
     
     def load_sector_mappings(self):
         """加载行业、概念、地区映射"""
